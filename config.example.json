@@ -1,0 +1,16 @@
+{
+  "portal_url": "http://10.254.241.66/",
+  "username": "你的学号或工号",
+  "password_dpapi": "",
+  "password": "",
+  "service_name": "移动",
+  "headless": true,
+  "browser_channel": "msedge",
+  "login_timeout_sec": 75,
+  "retries": 2,
+  "check_interval_sec": 60,
+  "portal_http_timeout_sec": 5,
+  "require_ethernet": true,
+  "wait_ready_sec": 8,
+  "link_grace_sec": 12
+}
