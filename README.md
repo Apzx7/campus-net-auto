@@ -58,10 +58,21 @@
 **第 1 步：双击 `改账号密码.bat`**
 
 按提示依次输入：
-- 门户地址（直接回车用默认的）
+- 门户地址（直接回车用默认的 `http://10.254.241.66/`）
 - 你的学号
-- 你的密码（输入时不显示，输两遍）
+- 你的密码（**只需输一遍**，输入时不显示；程序会立刻联网验证对不对）
 - 你的运营商（`移动` / `电信` / `联通`）
+
+密码输错会当场提示并让你重输（最多 3 次机会），不用自己核对两遍：
+
+```
+正在验证账号密码…
+✗ 密码不对：账号绑定失败：CAS 登录未通过（HTTP 401）
+  请重新输入（直接回车可取消）
+```
+
+> 离线环境（连门户都访问不了）可以用 `--skip-verify` 跳过验证：
+> `python connect.py --setup --interactive --skip-verify`
 
 **第 2 步：双击 `立即连接一次.bat`**
 
@@ -140,6 +151,7 @@ powershell -ExecutionPolicy Bypass -File .\install-task.ps1
 | `python connect.py --headful` | 显示浏览器窗口（排查问题用） |
 | `python connect.py --diagnose` | 抓取登录页结构到 `logs/diagnose-*.json` |
 | `python connect.py --setup --plain` | 明文保存密码（不推荐） |
+| `python connect.py --setup --interactive --skip-verify` | 配置时跳过联网验证（离线环境用） |
 | `powershell -File .\install-task.ps1 -IntervalMinutes 5` | 额外每 5 分钟自检 |
 | `powershell -File .\uninstall-task.ps1` | 删除计划任务 |
 
