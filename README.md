@@ -1,10 +1,12 @@
-# 校园网自动连接（锐捷 SAM+ / CAS-SSO 门户）
+# CUIT 校园网自动连接（成都信息工程大学 · 锐捷 SAM+ / CAS-SSO 门户）
 
 掉线后自动完成认证并验证真的能上网。**纯 HTTP 实现，一次认证约 0.3 秒，不弹浏览器。**
 
-> 本项目按 **成都信息工程大学** 的门户（`10.254.241.66`）实测写成。
-> 同一套锐捷 SAM+ 5.x / CAS-SSO 门户的学校大概率通用，换学校通常只需改
-> `config.json` 里的 `portal_url` 和 `service_name`，详见「换学校怎么改」。
+> **适用对象：成都信息工程大学（CUIT）** 的校园网，门户为锐捷 SAM+ 5.x / CAS-SSO 架构
+> （门户地址 `10.254.241.66`）。运营商支持**移动 / 电信 / 联通**。
+>
+> 其他采用同款锐捷 SAM+ 5.x / CAS-SSO 门户的学校大概率也能用，
+> 换学校通常只需改 `config.json` 里的 `portal_url` 和 `service_name`，详见「换学校怎么改」。
 
 ## 它做什么
 
@@ -186,3 +188,30 @@ powershell -File .\tests\detect-campus-ethernet.tests.ps1      # 网卡检测测
 - 防的是"配置文件被人翻到"，**不防**能登录 Windows 账户的人。
 - `config.json` 已在 `.gitignore` 里，不会误传。
 - 请只在自己的设备、自己的账号上使用。
+
+## 适用说明
+
+| 项目 | 说明 |
+| --- | --- |
+| 学校 | 成都信息工程大学（CUIT，Chengdu University of Information Technology） |
+| 门户厂商 | 锐捷网络 Ruijie，SAM+ 5.x 统一身份认证 |
+| 认证架构 | ePortal + CAS-SSO（`cas-sso` 平台） |
+| 门户地址 | `http://10.254.241.66/` |
+| 运营商 | 移动 `cmcc` / 电信 `telecom` / 联通 `unicom` |
+| 实测环境 | Windows 10，Python 3.13，Microsoft Edge |
+
+本项目的认证链路是通过 **Burp Suite 抓包**逆向后实现的，不含任何破解行为——
+所有请求都是你在浏览器里手动登录时会发出的正常请求，只是自动化了而已。
+
+首次实现时间：2026 年 10 月。如果学校后来升级了门户，`connect.py` 顶部的
+`SEL_*` 选择器和 `http_login()` 里的接口路径可能需要同步调整。
+
+## 许可证
+
+[MIT License](LICENSE) —— 可自由使用、修改、分发，保留版权声明即可。
+
+## 致谢
+
+- 认证链路的抓包分析来自实际使用中的反向工程
+- 浏览器回退方案基于 [Playwright](https://playwright.dev/)
+
