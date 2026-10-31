@@ -201,6 +201,92 @@ powershell -File .\tests\detect-campus-ethernet.tests.ps1      # 网卡检测测
 - `config.json` 已在 `.gitignore` 里，不会误传。
 - 请只在自己的设备、自己的账号上使用。
 
+## 计划任务的权限与透明度
+
+装成计划任务后会"自动检测网络变化并触发程序"，听起来像监控软件。这里把它到底做了什么、
+有什么权限讲清楚，方便你自己核对，也方便向同学解释。
+
+### 权限是最低档的
+
+```
+运行身份 : 当前用户（不是 SYSTEM）
+LogonType: Interactive（需要你已登录）
+RunLevel : Limited（普通权限，未提权）
+```
+
+| 项 | 本项目 | 高危程序的典型特征 |
+| --- | --- | --- |
+| 运行身份 | 当前用户 | SYSTEM / TrustedInstaller |
+| 权限级别 | Limited（不提权） | Highest（管理员） |
+| 运行时机 | 仅登录后 | 无论是否登录 |
+| 二进制 | `pythonw.exe`（Python 官方） | 无签名 / 临时路径 |
+| 脚本位置 | 项目目录，可读 | 隐藏目录 / Temp |
+| 网络行为 | 只连校园网内网门户 | 连境外 IP |
+| 持久化 | 3 个固定触发器 | 注册表 Run / 服务 / WMI 订阅 |
+
+因此它**不具备**木马的常见能力：
+
+- **不提权** —— 改不了系统设置，装不了驱动
+- **不常驻** —— 跑完就退出，任务管理器里查不到残留进程
+- **不联网外发** —— 只访问学校的 `10.254.241.66`，日志里没有外部地址
+- **不隐藏** —— 任务名、路径、参数都写在任务计划程序里
+
+### 它订阅的 3 个事件都是 Windows 标准事件
+
+| 触发器 | 事件源 | 用途 |
+| --- | --- | --- |
+| 登录 Windows | `AtLogOn` | 开机后连一次 |
+| 休眠唤醒 | `Power-Troubleshooter` 事件 1 | 唤醒后连一次 |
+| 网络连上 | `NetworkProfile` 事件 10000 | 插网线/切换网络后连一次 |
+
+这些是公开的事件订阅，杀毒软件、VPN、网盘客户端普遍在用。
+
+### 唯一"像后台程序"的地方：`pythonw.exe`
+
+`pythonw` 是 Python 官方的无控制台版本，用它是不想让每次触发都弹黑窗口。
+代价是运行时看不到界面。
+
+**如果你更希望"看得见"，** 把计划任务改成用 `python.exe`：
+
+```powershell
+$t = Get-ScheduledTask -TaskName 'CampusNet-AutoConnect'
+$t.Actions.Execute = (Get-Command python.exe).Source
+Set-ScheduledTask -TaskName 'CampusNet-AutoConnect' -Action $t.Actions
+```
+
+代价是每次触发会闪一下控制台窗口，但行为完全可见。
+
+### 随时可以暂停 / 恢复 / 卸载
+
+```powershell
+Disable-ScheduledTask -TaskName 'CampusNet-AutoConnect'    # 暂停（保留配置）
+Enable-ScheduledTask  -TaskName 'CampusNet-AutoConnect'    # 恢复
+powershell -ExecutionPolicy Bypass -File .\uninstall-task.ps1   # 彻底删除
+```
+
+### 两条命令自证清白
+
+想确认它没干别的，直接用日志验证：
+
+```powershell
+# 1) 历史访问过的所有地址（应只有学校门户 + 几个公共服务探测点）
+Select-String -Path logs\connect.log -Pattern 'https?://[^\s;)]+' -AllMatches |
+  ForEach-Object { $_.Matches } | ForEach-Object { $_.Value } | Sort-Object -Unique
+
+# 2) 是否有残留后台进程（应返回空）
+Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+  Where-Object { $_.CommandLine -like '*connect.py*' }
+```
+
+### 已知副作用
+
+- **重复认证可能短暂中断**：网络抖动时若误判为离线并重新认证，锐捷可能顶掉旧会话，
+  造成几秒中断。代码在认证前会先确认离线，这种情况少见但存在。
+- **日志含学号**：`logs/connect.log` 记录每次认证（含 `sessionId`），已在 `.gitignore` 中，
+  请勿手动上传。
+- **换 Windows 账户后失效**：DPAPI 密文绑定账户，重装系统或换账户后需重新
+  「改账号密码.bat」。
+
 ## 适用说明
 
 | 项目 | 说明 |
