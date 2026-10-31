@@ -400,6 +400,40 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _ac_name() -> str:
+    """接入设备（AC）名称。换学校若设备厂商不同，改这里即可。"""
+    return "H3C-CR16010-F"
+
+
+def resolve_session(portal_url: str, ip: str = "", timeout: float = 10.0):
+    """请求 ePortal 入口，拿到 (sessionId, nasIp, cookie)。
+
+    三处（认证 / 在线确认 / 入口探测）共用同一套解析，避免字符串重复。
+    返回的空字符串表示没拿到，调用方自行决定如何处理。
+    """
+    base = portal_url.rstrip("/")
+    ip = ip or _local_ipv4(portal_url)
+    if not ip:
+        return "", "", ""
+    entry = f"{base}/eportal/index.jsp?wlanuserip={ip}&wlanacname={_ac_name()}"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    try:
+        opener.open(urllib.request.Request(entry, headers={"User-Agent": "Mozilla/5.0"}),
+                    timeout=timeout)
+        return "", "", ""
+    except urllib.error.HTTPError as exc:
+        loc = exc.headers.get("Location", "") or ""
+        raw = exc.headers.get("Set-Cookie", "") or ""
+        m = re.search(r"JSESSIONID=([0-9A-Fa-f]+)", raw)
+        cookie = f"JSESSIONID={m.group(1)}" if m else ""
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+        sid = (qs.get("sessionId") or [""])[0]
+        nas = (qs.get("nasIp") or [""])[0]
+        return sid, nas, cookie
+    except Exception:  # noqa: BLE001
+        return "", "", ""
+
+
 def http_login(cfg: dict, entry_url: str = "") -> tuple[bool, str]:
     """不走浏览器，直接调门户接口完成认证。
 
@@ -410,26 +444,27 @@ def http_login(cfg: dict, entry_url: str = "") -> tuple[bool, str]:
     if not ip:
         return False, "取不到本机 IP"
 
-    # 1) 入口跳转拿 sessionId
-    entry = entry_url or f"{base}/eportal/index.jsp?wlanuserip={ip}&wlanacname=H3C-CR16010-F"
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
-    session_id, cookie, nas_ip = "", "", ""
-    try:
-        req = urllib.request.Request(entry, headers={"User-Agent": "Mozilla/5.0"})
-        with opener.open(req, timeout=10) as resp:
-            log.debug("入口返回 %s（无跳转）", resp.getcode())
-    except urllib.error.HTTPError as exc:
-        loc = exc.headers.get("Location", "") or ""
-        raw_cookie = exc.headers.get("Set-Cookie", "") or ""
-        m = re.search(r"JSESSIONID=([0-9A-Fa-f]+)", raw_cookie)
-        if m:
-            cookie = f"JSESSIONID={m.group(1)}"
-        qs = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
-        session_id = (qs.get("sessionId") or [""])[0]
-        nas_ip = (qs.get("nasIp") or [""])[0]
-        log.info("入口跳转：sessionId=%s nasIp=%s", session_id or "?", nas_ip or "?")
-    except Exception as exc:  # noqa: BLE001
-        return False, f"打开入口失败：{type(exc).__name__}: {exc}"
+    # 1) 入口跳转拿 sessionId（entry_url 存在时直接用它，兼容劫持跳转）
+    if entry_url:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+        session_id, cookie, nas_ip = "", "", ""
+        try:
+            opener.open(urllib.request.Request(entry_url,
+                        headers={"User-Agent": "Mozilla/5.0"}), timeout=10)
+        except urllib.error.HTTPError as exc:
+            loc = exc.headers.get("Location", "") or ""
+            raw_cookie = exc.headers.get("Set-Cookie", "") or ""
+            m = re.search(r"JSESSIONID=([0-9A-Fa-f]+)", raw_cookie)
+            if m:
+                cookie = f"JSESSIONID={m.group(1)}"
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query)
+            session_id = (qs.get("sessionId") or [""])[0]
+            nas_ip = (qs.get("nasIp") or [""])[0]
+        except Exception as exc:  # noqa: BLE001
+            return False, f"打开入口失败：{type(exc).__name__}: {exc}"
+    else:
+        session_id, nas_ip, cookie = resolve_session(cfg["portal_url"], ip)
+    log.info("入口跳转：sessionId=%s nasIp=%s", session_id or "?", nas_ip or "?")
 
     if not session_id:
         return False, "入口没有返回 sessionId（可能已在线，或接入设备未下发）"
@@ -543,25 +578,16 @@ def cas_bind_session(cfg: dict, session_id: str, nas_ip: str, user_ip: str,
     if code in (301, 302, 303) and ("code=" in loc or "callbackAuthorize" in loc):
         return True, "CAS 登录成功"
     return False, f"CAS 登录未通过（HTTP {code}）"
-    """再问一次门户：终端是否已在线。"""
+
+
+def http_user_online(cfg: dict) -> bool:
+    """再问一次门户：终端是否已在线。
+
+    注意：`check_online()` 才是最终判据（它验证真的能出网）。这个函数只用于
+    "接口说成功但出口还没放行"时做二次确认，失败一律返回 False。
+    """
     base = cfg["portal_url"].rstrip("/")
-    ip = _local_ipv4(cfg["portal_url"])
-    if not ip:
-        return False
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler(), _NoRedirect())
-    entry = f"{base}/eportal/index.jsp?wlanuserip={ip}&wlanacname=H3C-CR16010-F"
-    sid, cookie = "", ""
-    try:
-        opener.open(urllib.request.Request(entry, headers={"User-Agent": "Mozilla/5.0"}), timeout=8)
-    except urllib.error.HTTPError as exc:
-        loc = exc.headers.get("Location", "") or ""
-        raw = exc.headers.get("Set-Cookie", "") or ""
-        m = re.search(r"JSESSIONID=([0-9A-Fa-f]+)", raw)
-        if m:
-            cookie = f"JSESSIONID={m.group(1)}"
-        sid = (urllib.parse.parse_qs(urllib.parse.urlparse(loc).query).get("sessionId") or [""])[0]
-    except Exception:  # noqa: BLE001
-        return False
+    sid, _nas, cookie = resolve_session(cfg["portal_url"])
     if not sid:
         return False
     try:
@@ -1076,26 +1102,31 @@ def _ip_state_file() -> Path:
     return LOG_DIR / ".last_ip"
 
 
-def _remember_ip(cfg: dict) -> str:
-    """记录本机 IP，返回"上次 IP → 本次不同"时的说明（相同或首次返回空）。
+def _read_last_ip() -> str:
+    try:
+        return _ip_state_file().read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001
+        return ""
 
-    休眠唤醒 / 换网口后 DHCP 常会重新分配 IP，而门户的认证会话是按 IP 记的，
-    IP 一变旧会话就失效了——这时候即使探测显示"在线"也要重新认证。
+
+def _write_last_ip(ip: str) -> None:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _ip_state_file().write_text(ip, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _ip_changed(cfg: dict) -> str:
+    """本次 IP 与上次记录不同则返回说明，否则返回空。
+
+    只读不写——**必须等认证成功后才由调用方写入**（`_write_last_ip`）。
+    否则一旦第一次认证失败，IP 已被记成新的，后续就不会再触发重认证了。
     """
     cur = _local_ipv4(cfg["portal_url"])
     if not cur:
         return ""
-    path = _ip_state_file()
-    prev = ""
-    try:
-        prev = path.read_text(encoding="utf-8").strip()
-    except Exception:  # noqa: BLE001
-        prev = ""
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(cur, encoding="utf-8")
-    except Exception:  # noqa: BLE001
-        pass
+    prev = _read_last_ip()
     if prev and prev != cur:
         return f"{prev} → {cur}"
     return ""
@@ -1133,12 +1164,14 @@ def connect_once(cfg: dict, headful: bool = False, boot: bool = False) -> int:
 
     # IP 变了说明 DHCP 重新分配过（休眠唤醒/换网口），旧认证会话多半已失效。
     # 这时即便探测"在线"也不可信，必须重新认证。
-    ip_changed = _remember_ip(cfg)
+    ip_changed = _ip_changed(cfg)
     if ip_changed:
         log.info("检测到本机 IP 变化（%s），重新认证以恢复会话", ip_changed)
         online = False
 
     if online:
+        # 确认在线时也把 IP 记下来，避免把"稳定在线"误判成下次的变化
+        _write_last_ip(_local_ipv4(cfg["portal_url"]))
         log.info("已经在线（%s），无需登录", detail)
         return 0
     log.info("当前未联网（%s），准备登录", detail)
@@ -1168,12 +1201,16 @@ def connect_once(cfg: dict, headful: bool = False, boot: bool = False) -> int:
         if ok:
             online, detail = check_online()
             if online or http_user_online(cfg):
+                # 认证确认成功，才把当前 IP 记为"已处理过"，
+                # 失败时不写，下次触发仍能重新认证
+                _write_last_ip(_local_ipv4(cfg["portal_url"]))
                 log.info("联网检测通过：%s", detail or "userOnline=true")
                 return 0
             log.warning("接口说成功但流量还没放行，等 5 秒再看")
             time.sleep(5)
             online, detail = check_online()
             if online:
+                _write_last_ip(_local_ipv4(cfg["portal_url"]))
                 log.info("联网检测通过：%s", detail)
                 return 0
         last_msg = msg
@@ -1186,6 +1223,7 @@ def connect_once(cfg: dict, headful: bool = False, boot: bool = False) -> int:
         ok, msg = login(cfg, headful=headful, entry_url=entry)
         log.info("%s", msg)
         if ok:
+            _write_last_ip(_local_ipv4(cfg["portal_url"]))
             return 0
         last_msg = msg
         if "被拒绝" in msg or "没找到登录表单" in msg:
@@ -1202,14 +1240,6 @@ def _ask(prompt: str, secret: bool = False) -> str:
     except (EOFError, KeyboardInterrupt):
         print()
         return ""
-
-
-def _interactive() -> bool:
-    """是否有人在终端前操作（计划任务/管道里跑 --setup 会卡在等输入）。"""
-    try:
-        return bool(sys.stdin) and sys.stdin.isatty()
-    except Exception:  # noqa: BLE001
-        return False
 
 
 def do_setup(cfg: dict, args) -> int:
