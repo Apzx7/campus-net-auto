@@ -93,13 +93,16 @@ CONNECT_BUTTON_TEXTS = ("连接", "立即连接", "上线", "立即上线", "确
 BAIT_URL = "http://captive.apple.com/hotspot-detect.html"
 
 CONNECTIVITY_PROBES = (
-    # 顺序按实测 DNS 解析速度排：gstatic/baidu 解析 0.03s，miui 那个要 11s，别放第一个
-    ("http://www.gstatic.com/generate_204", 204, None),
+    # 按实测"总耗时"排序（DNS + 连接）：baidu 最快且能校验内容，放第一个。
+    # gstatic/miui 的 DNS 解析要 11 秒，只能当兜底。
     ("https://www.baidu.com/", 200, b"baidu"),
     ("http://www.msftconnecttest.com/connecttest.txt", 200, b"Microsoft Connect Test"),
+    ("http://www.gstatic.com/generate_204", 204, None),
     ("http://connect.rom.miui.com/generate_204", 204, None),
 )
-# 开机第一轮用这个：纯 IP、不做 DNS、不依赖 TLS，能在几十毫秒内出结果
+# 开机第一轮用这个：纯 IP、不做 DNS、能在几十毫秒内出结果。
+# 注意：它只能证明"内网通"，不能证明"能上外网"——校园网认证前网关也放行它，
+# 所以它只在 check_online 里当"快速否定"用，绝不单独作为在线判据。
 FAST_PROBE = ("http://223.5.5.5/", (200, 301, 302, 403, 404))  # 阿里 DNS 的 80 端口
 
 log = logging.getLogger("campus")
@@ -163,39 +166,52 @@ def _probe_once(url: str, expect: int, marker, timeout: float):
 def check_online(timeout: float = 6.0) -> tuple[bool, str]:
     """返回 (是否已联网, 说明)。
 
-    先用纯 IP 快速探测（几十毫秒，不做 DNS）；不行再并发探测多个域名。
-    串行探测的致命问题是某个域名 DNS 解析可能卡十几秒（实测 miui 那个要 11 秒）。
+    判据分两层，很关键：
+    - 快速通道（纯 IP）只能**快速否定**：连它都不通，肯定没网；通了不代表能上外网。
+      校园网在未认证时会放行这个 IP，如果拿它当在线判据，休眠唤醒后会误判"已在线"
+      而不去认证，表现就是"显示在线但上不了网"。
+    - 真正的在线判据必须用**能识别劫持的域名探测**（204 端点 / 校验响应内容）。
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    # ① 快速通道：纯 IP，无 DNS
+    # ① 快速否定：纯 IP，连不上就不用再等了（快 0.05s）
     url, codes = FAST_PROBE
+    reachable = False
     try:
         with _open_no_redirect(url, min(timeout, 3.0)) as resp:
-            if resp.getcode() in codes:
-                return True, f"{url} -> {resp.getcode()}(快速探测)"
+            reachable = resp.getcode() in codes
     except urllib.error.HTTPError as exc:
-        if exc.code in codes:
-            return True, f"{url} -> {exc.code}(快速探测)"
+        reachable = exc.code in codes
     except Exception:  # noqa: BLE001
-        pass
+        reachable = False
+    if not reachable:
+        return False, f"{url} 不可达（内网未通）"
 
-    # ② 域名探测：并发，任一命中即在线
+    # ② 真正的判据：并发探测域名，**谁先成功就用谁**（不等最慢的那个）
+    from concurrent.futures import FIRST_COMPLETED, wait
+
     results: list[str] = []
-    with ThreadPoolExecutor(max_workers=len(CONNECTIVITY_PROBES)) as pool:
-        futures = [
-            pool.submit(_probe_once, u, e, m, timeout)
+    pool = ThreadPoolExecutor(max_workers=len(CONNECTIVITY_PROBES))
+    try:
+        futs = {
+            pool.submit(_probe_once, u, e, m, timeout): u
             for u, e, m in CONNECTIVITY_PROBES
-        ]
-        for fut in futures:
-            try:
-                ok, msg = fut.result(timeout=timeout + 2)
-            except Exception as exc:  # noqa: BLE001
-                results.append(f"探测超时: {exc}")
-                continue
-            if ok:
-                return True, msg
-            results.append(msg)
+        }
+        hard_deadline = time.time() + timeout + 2
+        while futs and time.time() < hard_deadline:
+            done, _ = wait(list(futs), timeout=0.5, return_when=FIRST_COMPLETED)
+            for fut in done:
+                futs.pop(fut, None)
+                try:
+                    ok, msg = fut.result()
+                except Exception as exc:  # noqa: BLE001
+                    results.append(f"探测异常: {exc}")
+                    continue
+                if ok:
+                    return True, msg
+                results.append(msg)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return False, "; ".join(results) or "无可用探测点"
 
 
@@ -1056,6 +1072,35 @@ def diagnose(cfg: dict, headful: bool = True) -> int:
 # --------------------------------------------------------------------------- #
 # 连接主流程
 # --------------------------------------------------------------------------- #
+def _ip_state_file() -> Path:
+    return LOG_DIR / ".last_ip"
+
+
+def _remember_ip(cfg: dict) -> str:
+    """记录本机 IP，返回"上次 IP → 本次不同"时的说明（相同或首次返回空）。
+
+    休眠唤醒 / 换网口后 DHCP 常会重新分配 IP，而门户的认证会话是按 IP 记的，
+    IP 一变旧会话就失效了——这时候即使探测显示"在线"也要重新认证。
+    """
+    cur = _local_ipv4(cfg["portal_url"])
+    if not cur:
+        return ""
+    path = _ip_state_file()
+    prev = ""
+    try:
+        prev = path.read_text(encoding="utf-8").strip()
+    except Exception:  # noqa: BLE001
+        prev = ""
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(cur, encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+    if prev and prev != cur:
+        return f"{prev} → {cur}"
+    return ""
+
+
 def connect_once(cfg: dict, headful: bool = False, boot: bool = False) -> int:
     if cfg.get("require_ethernet", True) or boot:
         # 刚插上网线时网卡还没拿到 DHCP 地址，这里给一小段宽限期，别一次判死
@@ -1085,6 +1130,14 @@ def connect_once(cfg: dict, headful: bool = False, boot: bool = False) -> int:
             online, detail = check_online()
             if online:
                 break
+
+    # IP 变了说明 DHCP 重新分配过（休眠唤醒/换网口），旧认证会话多半已失效。
+    # 这时即便探测"在线"也不可信，必须重新认证。
+    ip_changed = _remember_ip(cfg)
+    if ip_changed:
+        log.info("检测到本机 IP 变化（%s），重新认证以恢复会话", ip_changed)
+        online = False
+
     if online:
         log.info("已经在线（%s），无需登录", detail)
         return 0
@@ -1159,24 +1212,6 @@ def _interactive() -> bool:
         return False
 
 
-def _verify_credentials(cfg: dict, pwd: str) -> tuple[bool, str]:
-    """用一次真实认证验证账号密码对不对，避免用户输两遍。"""
-    probe = dict(cfg)
-    probe["password"] = pwd
-    probe["password_dpapi"] = ""
-    try:
-        ok, msg = http_login(probe)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"验证时出错：{type(exc).__name__}: {exc}"
-    if ok:
-        return True, "账号密码正确"
-    # 401 / 密码类错误 → 明确是凭据问题；其他（门户不可达等）不算"密码错"
-    low = msg.lower()
-    if "401" in msg or "密码" in msg or "credential" in low:
-        return False, f"密码不对：{msg}"
-    return False, msg
-
-
 def do_setup(cfg: dict, args) -> int:
     if not getattr(args, "interactive", False):
         print("--setup 需要加 --interactive 在终端里交互输入（双击「改账号密码.bat」即可）。")
@@ -1193,28 +1228,14 @@ def do_setup(cfg: dict, args) -> int:
         print("账号不能为空，已取消。")
         return 2
 
-    # 只输一遍，然后用真实认证校验（比让人输两遍更准确）
-    for attempt in range(1, 4):
-        pwd = _ask("密码（输入时不显示）: ", secret=True)
-        if not pwd:
-            print("密码为空，已取消。")
-            return 2
-
-        if getattr(args, "skip_verify", False):
-            break
-        print("正在验证账号密码…")
-        ok, msg = _verify_credentials(cfg, pwd)
-        if ok:
-            print(f"✓ {msg}")
-            break
-        print(f"✗ {msg}")
-        if attempt < 3:
-            print("  请重新输入（直接回车可取消）\n")
-        else:
-            keep = _ask("验证没通过，仍要保存吗？(y/N): ")
-            if keep.strip().lower() != "y":
-                print("已取消，未保存。")
-                return 2
+    pwd = _ask("密码（输入时不显示）: ", secret=True)
+    if not pwd:
+        print("密码为空，已取消。")
+        return 2
+    confirm = _ask("再输一次: ", secret=True)
+    if pwd != confirm:
+        print("两次输入不一致，已取消。")
+        return 2
 
     if args.plain:
         cfg["password"] = pwd
@@ -1254,7 +1275,6 @@ def main(argv=None) -> int:
     parser.add_argument("--boot", action="store_true", help="开机模式：先查网线，再等网络就绪，连上就退出")
     parser.add_argument("--diagnose", action="store_true", help="抓取登录页结构")
     parser.add_argument("--plain", action="store_true", help="配置时明文保存密码")
-    parser.add_argument("--skip-verify", action="store_true", help="配置时不联网验证密码（离线环境用）")
     parser.add_argument("--quiet", action="store_true", help="静默模式（计划任务用）")
     parser.add_argument("--verbose", action="store_true", help="输出调试日志")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH)
