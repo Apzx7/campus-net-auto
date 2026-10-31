@@ -163,7 +163,7 @@ def _probe_once(url: str, expect: int, marker, timeout: float):
         return None, f"{url} -> {type(exc).__name__}: {exc}"
 
 
-def check_online(timeout: float = 6.0) -> tuple[bool, str]:
+def check_online(timeout: float = 3.5) -> tuple[bool, str]:
     """返回 (是否已联网, 说明)。
 
     判据分两层，很关键：
@@ -171,6 +171,9 @@ def check_online(timeout: float = 6.0) -> tuple[bool, str]:
       校园网在未认证时会放行这个 IP，如果拿它当在线判据，休眠唤醒后会误判"已在线"
       而不去认证，表现就是"显示在线但上不了网"。
     - 真正的在线判据必须用**能识别劫持的域名探测**（204 端点 / 校验响应内容）。
+
+    超时默认 3.5 秒：正常网络下 2 秒内必有结果；未认证时各探测点都会被拦截或超时，
+    没必要为"确认失败"等太久（默认值调大只会拖慢恢复）。
     """
     from concurrent.futures import ThreadPoolExecutor
 
@@ -178,7 +181,7 @@ def check_online(timeout: float = 6.0) -> tuple[bool, str]:
     url, codes = FAST_PROBE
     reachable = False
     try:
-        with _open_no_redirect(url, min(timeout, 3.0)) as resp:
+        with _open_no_redirect(url, min(timeout, 1.5)) as resp:
             reachable = resp.getcode() in codes
     except urllib.error.HTTPError as exc:
         reachable = exc.code in codes
@@ -1102,6 +1105,12 @@ def _ip_state_file() -> Path:
     return LOG_DIR / ".last_ip"
 
 
+def _link_has_ip(cfg: dict) -> bool:
+    """网卡是否已拿到可用 IPv4（不是 169.254 自动私有地址）。"""
+    ip = _local_ipv4(cfg["portal_url"])
+    return bool(ip) and not ip.startswith("169.254.")
+
+
 def _read_last_ip() -> str:
     try:
         return _ip_state_file().read_text(encoding="utf-8").strip()
@@ -1154,12 +1163,14 @@ def connect_once(cfg: dict, headful: bool = False, boot: bool = False) -> int:
         wait_until_ready(cfg, int(cfg.get("wait_ready_sec", 40)))
 
     online, detail = check_online()
-    if not online and boot:
-        # 刚恢复链路时 DHCP/路由可能还没通，再给一两秒
+    if not online and boot and not _link_has_ip(cfg):
+        # 只有在"网卡还没拿到地址"时才值得多等几轮；地址已经有了就等于网络栈就绪，
+        # 再重复探测只会白白多花 20+ 秒（每轮最多 8 秒）。
+        log.info("网卡尚未拿到地址，再多等几秒…")
         for _ in range(3):
             time.sleep(1)
-            online, detail = check_online()
-            if online:
+            if _link_has_ip(cfg):
+                online, detail = check_online()
                 break
 
     # IP 变了说明 DHCP 重新分配过（休眠唤醒/换网口），旧认证会话多半已失效。
